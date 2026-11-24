@@ -1,0 +1,1080 @@
+diff --git a/docs/back-office-readiness-problems.md b/docs/back-office-readiness-problems.md
+new file mode 100644
+index 0000000000..295c09d2f5
+--- /dev/null
++++ b/docs/back-office-readiness-problems.md
+@@ -0,0 +1,1074 @@
++# Back-office readiness: known problems
++
++Problems found in the code as it stands, in the areas the back office will rely on: draft orders,
++stock allocation, fulfillment, returns/refunds, the Transactions API, background tasks and webhooks.
++This document lists problems only. It does not propose fixes.
++
++Audit date: 2026-11-24, at commit `b8025bac2a`.
++
++## How to read this
++
++Each entry says what goes wrong, when, and where in the code. Paths are relative to the repo root.
++
++**Status** tells you how far each entry was checked:
++
++| Status | Meaning |
++|---|---|
++| Reproduced | The code shape was run in a minimal script (Django 5.2.19, the pinned version) and misbehaved as described. |
++| Verified | The cited lines were re-read and do what the entry says. For races this means the missing lock or re-check is confirmed; the race itself was not run. |
++| Traced | Found by a code-tracing pass; the cited lines were not independently re-read. |
++| Plausible | The code was read, but the failure needs timing or configuration that was not reproduced. |
++
++**When** tells you how likely you are to hit it:
++
++- *Every time*: deterministic for the described input.
++- *Concurrent*: needs two requests for the same object at nearly the same moment. That means two
++  employees, a double click, a client retry, or a staff action racing a payment-app callback or a
++  background task.
++- *Setting-dependent*: only with a non-default setting, which is named.
++
++### Limits of this audit
++
++- Nothing was run against a database and the Saleor test suite was not run. Everything except the
++  entries marked "Reproduced" comes from reading code.
++- The dashboard front end is not in this repository. Where an entry needs an unusual API input
++  (a negative quantity, a line from another order), whether the dashboard can send it is unknown.
++  Any app or script using the API can.
++- The lines checked with `git blame` date from long-standing commits, so these are not recent local
++  regressions.
++
++## Read these first
++
++The problems most likely to cost money, stock accuracy or staff time.
++
++| # | Problem | Area |
++|---|---|---|
++| [ST-1](#st-1) | Checkout ignores existing allocations, so stock is oversold | Stock |
++| [FU-1](#fu-1) | Two partial fulfillments at once ship more than was ordered | Fulfillment |
++| [FU-2](#fu-2), [FU-3](#fu-3) | Double approve or double cancel moves stock twice | Fulfillment |
++| [RR-1](#rr-1) | A refund amount of 0 refunds the whole charge | Refunds |
++| [RR-2](#rr-2), [RR-3](#rr-3) | A double click sends two refunds | Refunds |
++| [TX-1](#tx-1) | A payment report interrupted half-way is never applied to the order | Transactions |
++| [TX-7](#tx-7) | Staff-recorded transactions can be read without logging in | Transactions |
++| [WH-1](#wh-1) | After one 5xx, charge/refund/cancel requests are retried with an empty body | Webhooks |
++| [DO-1](#do-1) | Flipping one channel setting deletes voucher line discounts on every order | Draft orders |
++| [DO-2](#do-2) | Finalising a draft can run twice, or finalise totals that don't match the lines | Draft orders |
++| [BG-1](#bg-1) | Unconfirmed orders set to expire after N days expire months later | Background tasks |
++| [WH-2](#wh-2) | Apps installed from a manifest receive every channel's orders | Webhooks |
++| [BG-3](#bg-3), [WH-5](#wh-5) | A worker pod restart loses tasks; nothing re-sends the webhook | Tasks, webhooks |
++
++---
++
++## Draft orders
++
++<a id="do-1"></a>
++### DO-1. Enabling "include draft orders in voucher usage" deletes voucher line discounts across the whole database
++
++- **What happens:** the cleanup task is meant to remove voucher discounts from the channel's draft
++  orders. Its filter is `OrderLineDiscount.objects.filter(Exists(OrderLine.objects.filter(order_id__in=order_ids)))`.
++  The `Exists` is not tied to the discount row, so it is true for every row. Every voucher-type line
++  discount is deleted, on completed orders and in other channels too. The task also clears only
++  `voucher_code`; the draft's `voucher` link stays.
++- **When:** every time an admin switches the channel flag from off to on while that channel has at
++  least one draft with a voucher code and a line.
++- **Where:** `saleor/discount/tasks.py:304-324` (the delete is at 320-322), called from
++  `saleor/graphql/channel/mutations/channel_update.py:296-308`.
++- **Status:** Verified.
++
++<a id="do-2"></a>
++### DO-2. Finalising a draft takes no lock and never re-checks that it is still a draft
++
++- **What happens:** `draftOrderComplete` loads the order, checks `is_draft()` on that copy, and later
++  writes the new status unconditionally. Three failures follow:
++  - *Double completion.* Two finalise requests both pass the check. The order is "created" twice:
++    duplicate history events, `number_of_orders` +2, duplicate `ORDER_CREATED`/`ORDER_CONFIRMED`
++    webhooks and staff emails. For stock-tracked lines the second request either fails with an
++    unhandled database error or allocates a second time from another warehouse.
++  - *Delete after complete.* A delete (single or bulk) that saw a draft waits for the completion to
++    commit and then removes the finalised order. Its allocations disappear by cascade but
++    `Stock.quantity_allocated` is not reduced.
++  - *Edit during complete.* A line added or changed while completion is running ends up on a
++    finalised order whose total, subtotal and allocations were computed before the edit. Once the
++    order is confirmed its prices are never recalculated.
++- **When:** concurrent. The window covers stock checks and shipping-method webhooks, so it is not small.
++- **Where:** `saleor/graphql/order/mutations/draft_order_complete.py:139-220`;
++  `saleor/graphql/order/mutations/draft_order_delete.py:46-80`;
++  `saleor/graphql/order/bulk_mutations/draft_orders.py:63-72`;
++  line mutations lock only the order's pk and validate before the lock
++  (`order_lines_create.py:183-185`, `order_line_update.py:93`, `order_line_delete.py:59-72`).
++- **Status:** Verified.
++
++### DO-3. Bulk-deleting draft lines does not update the order
++
++- **What happens:** `draftOrderLinesBulkDelete` deletes the line rows and nothing else. The order's
++  total, subtotal, line count, weight and shipping still include the deleted lines, no history event
++  or webhook is produced, and the prices are not marked for recalculation. Finalising the draft
++  then finalises the stale total. The single-line delete does all of this correctly.
++- **When:** every time the bulk mutation is used on a draft whose prices were already calculated.
++- **Where:** `saleor/graphql/order/bulk_mutations/draft_orders.py:161-203`; contrast
++  `saleor/graphql/order/mutations/order_line_delete.py:83-119`.
++- **Status:** Verified. Whether the dashboard calls this mutation was not checked.
++
++### DO-4. Shipping cost goes stale when lines change
++
++- **What happens:** when the last shippable line is deleted, the shipping method and price are
++  cleared but `base_shipping_price` is not. The next recalculation adds it back into the total. After
++  completion the order shows shipping 0 and a total that still includes the old shipping amount.
++  The reverse also happens through the API: a shipping method set before any address or shippable
++  line exists is stored at price 0 and is not recomputed later, so the order completes with free
++  shipping.
++- **When:** every time, for a draft with a physical item, a digital item and paid shipping, when the
++  physical line is removed.
++- **Where:** `saleor/graphql/order/mutations/order_line_delete.py:83-95`;
++  `saleor/order/base_calculations.py:96`; `saleor/graphql/order/mutations/draft_order_complete.py:191-204`.
++- **Status:** Verified for the delete path. The reverse case is Traced.
++
++### DO-5. Voucher usage on drafts is counted wrongly
++
++Applies to channels with `include_draft_order_in_voucher_usage` on.
++
++- **Replacing a voucher never releases the old one.** The code increases usage for the new voucher
++  and only releases when the voucher is removed outright. The old code stays used; a single-use code
++  stays deactivated. Verified, `saleor/graphql/order/mutations/draft_order_update.py:346-360`.
++- **Re-saving a draft with the same code counts again.** There is no "unchanged" check. If the draft
++  already holds the last use, the save is rejected with "Voucher code is invalid." Verified, same lines.
++- **Deleting a draft can erase another order's once-per-customer record.** Traced,
++  `saleor/graphql/order/mutations/draft_order_delete.py:87-95`.
++- **Bulk delete releases usage for orders it refused to delete.** Traced,
++  `saleor/graphql/order/bulk_mutations/draft_orders.py:94-120`.
++- The limit check and the increment are separate steps, so two drafts can both take the last use.
++
++### DO-6. Lines whose product was deleted drop out of totals on unconfirmed orders
++
++- **What happens:** deleting a product or variant removes its lines from draft orders only.
++  Unconfirmed orders keep the line with no variant. Price recalculation skips lines without a
++  variant, so the order still lists the line at its old price while the total excludes it.
++- **When:** every time a product in an unconfirmed order is deleted and the order is then edited.
++- **Where:** `saleor/order/fetch.py:145-148`; `saleor/order/calculations.py:259`.
++- **Status:** Verified for the skip. The rest is Traced.
++
++### DO-7. A double submit can add two manual order discounts
++
++- **What happens:** the "Order already has assigned discount" check runs before the transaction with
++  no lock, and nothing in the database prevents a second row. Both discounts are applied, and
++  further adds are refused.
++- **When:** concurrent.
++- **Where:** `saleor/graphql/order/mutations/order_discount_add.py:42-87`.
++- **Status:** Verified.
++
++### DO-8. A discount value of 0 is silently replaced by the previous value
++
++- **What happens:** `input["value"] = input.get("value") or order_line.unit_discount_value`. Zero is
++  treated as "not provided". Setting a manual discount to 0 keeps the old value and reports success.
++  On a line with a 10% promotion, entering a fixed discount of 0 creates a fixed discount of 10.
++- **When:** every time.
++- **Where:** `saleor/graphql/order/mutations/order_line_discount_update.py:46-47`;
++  `saleor/graphql/order/mutations/order_discount_update.py:45-46`.
++- **Status:** Verified for the line mutation.
++
++### DO-9. Finalising a large draft is slow and holds stock locks throughout
++
++- **What happens:** stock is allocated one line at a time inside one transaction, and a bulk update
++  of all lines runs inside that per-line loop. A 100-line order issues 100 bulk updates of 100 rows.
++  Stock locks are taken in line order, not key order, so two drafts with the same products in
++  opposite order can deadlock; one employee then gets an internal error.
++- **When:** every time for the slowness; concurrent for the deadlock.
++- **Where:** `saleor/graphql/order/mutations/draft_order_complete.py:224-260`.
++- **Status:** Verified for the loop. The deadlock is Plausible.
++
++### DO-10. Smaller items
++
++- With the default channel setting (`include_draft_order_in_voucher_usage` off), draft-originated
++  orders never count against voucher limits, yet order expiry still decrements the usage counter.
++  Traced, `saleor/graphql/order/utils.py:349-362`, `saleor/order/tasks.py:68-103`.
++- Product deletion schedules `recalculate_orders_task` with a bare `.delay()` inside the open
++  transaction, and several writers change prices without bumping `updated_at`. A recalculation in
++  flight can clear the refresh flag and leave the old total. Plausible,
++  `saleor/graphql/product/mutations/product_variant/product_variant_delete.py:114-137`,
++  `saleor/order/calculations.py:142-193`.
++- A prepaid draft with a gift-card variant that does not track inventory may not get its gift card
++  issued on completion. Plausible, `saleor/graphql/order/mutations/draft_order_complete.py:229-268`.
++
++---
++
++## Stock allocation
++
++<a id="st-1"></a>
++### ST-1. Checkout completion ignores every existing allocation, so stock is oversold
++
++- **What happens:** `allocate_stocks` builds the list of stock ids as a one-shot generator. When
++  reservations are checked, the reservation query consumes it. The allocation query that follows
++  gets an empty list and returns nothing, so availability is computed as if nothing were allocated.
++  Two checkouts for the last unit both succeed. Allocations also pile onto the first-sorted
++  warehouse beyond its physical stock, and staff fulfilling from it get "insufficient stock".
++- **When:** every time reservations are checked. Storefront checkout always passes
++  `check_reservations=True`. Draft completion does so when stock reservation is enabled in site
++  settings. A back office that only uses draft orders with reservations off is not affected by this
++  path, but shares stock with any storefront that is.
++- **Where:** `saleor/warehouse/management.py:150-163` and `243-265`; callers
++  `saleor/checkout/complete_checkout.py:840-851`, `1296-1307`;
++  `saleor/graphql/order/mutations/draft_order_complete.py:236-246`.
++- **Status:** Reproduced. With the reservation filter first the allocation query returned `[]`;
++  without it, the real sum.
++
++### ST-2. Several lines of the same product in one checkout each see the full stock
++
++- **What happens:** the allocation loop reads how much is already allocated but never adds what it
++  has just allocated for the previous line. Three lines of 2 against a stock of 5 all succeed: 6
++  allocated from 5.
++- **When:** every time a checkout holds the same variant on more than one line.
++- **Where:** `saleor/warehouse/management.py:185-195`, `316-356`.
++- **Status:** Verified.
++
++### ST-3. Changing a line quantity twice at once leaves stock allocated forever
++
++- **What happens:** `orderLineUpdate` reads the old quantity before taking the order lock and does
++  not re-read it. Two overlapping updates from 5 to 8 each add 3. The line says 8, the allocation
++  says 11. Fulfillment releases only what is fulfilled, so 3 units stay allocated; the cleanup task
++  only deletes zero rows.
++- **When:** concurrent, on unconfirmed orders.
++- **Where:** `saleor/graphql/order/mutations/order_line_update.py:49`, `93-108`;
++  `saleor/order/utils.py:529-556`.
++- **Status:** Verified.
++
++### ST-4. Adding a line with too little stock returns "Internal Server Error"
++
++- **What happens:** on an unconfirmed order, `orderLinesCreate` allocates stock immediately. The
++  resulting `InsufficientStock` is not caught; only tax errors are. The employee gets a top-level
++  internal error with no field message. `orderLineUpdate` handles the same case properly.
++- **When:** every time.
++- **Where:** `saleor/graphql/order/mutations/order_lines_create.py:160-177`;
++  `saleor/order/utils.py:329-344`.
++- **Status:** Verified.
++
++<a id="st-5"></a>
++### ST-5. Out-of-stock and back-in-stock webhooks fire for the wrong stock
++
++- **What happens:** the per-stock webhooks are registered in a loop as
++  `transaction.on_commit(lambda: trigger_...(stock, ...))`. The lambda reads the loop variable when
++  the transaction commits, so every callback sees the last item. The stock that actually ran out
++  gets no event; the last one gets several. Separately, fulfilling from an already-empty stock
++  re-sends "out of stock" each time, because there is no before/after comparison.
++- **When:** every time an allocation, fulfillment, cancel, expiry, refund or return touches more
++  than one stock and the one that changed state is not the last.
++- **Where:** `saleor/warehouse/management.py:219-231`, `426-438`, `644-648`, `789-795`.
++- **Status:** Reproduced. Three lambdas registered in a loop all fired with the last value.
++
++### ST-6. The allocated total on a stock drifts when one fulfillment releases two allocations of it
++
++- **What happens:** each allocation row carries its own copy of the stock. Each copy gets
++  "allocated minus n" and both go into one bulk update, which applies only the first. Deallocating
++  6 and 4 from 10 leaves 4.
++- **When:** every time an order has two lines of the same variant allocated in one warehouse and
++  both are fulfilled together.
++- **Effect:** `Stock.quantityAllocated` shown to staff is too high until the nightly reconciliation,
++  and stock-update mutations that read this field misreport in/out of stock meanwhile.
++- **Where:** `saleor/warehouse/management.py:402-406`, `449`.
++- **Status:** Reproduced.
++
++### ST-7. Deleting a stock entry or a warehouse silently drops the reservations of open orders
++
++*Corrected on re-examination. The first version ended "the quantity can be sold again". That was
++wrong as written: the removed entry's quantity is deleted with it, so nothing can be sold from it.*
++
++- **What happens:** the stock-entry delete, the warehouse delete and the stock removal in
++  `productVariantBulkUpdate` do not check for allocations. `Stock.warehouse`, `Allocation.stock` and
++  `Reservation.stock` all cascade. Deleting the entry removes its quantity and, with it, every
++  allocation and checkout reservation held against it. Open orders keep their lines and still show
++  the items as to be fulfilled, but nothing is reserved for them any more. No error is returned and
++  no event is written on the affected orders.
++- **Can the removed stock be resold?** Not from the removed entry. Availability is the sum of the
++  stock rows that exist, minus their allocations; a deleted row contributes nothing. With no other
++  stock for the product, new orders and checkouts are refused as out of stock.
++- **Where overselling does come from:**
++  - *Other warehouses.* If the product has stock elsewhere, the affected orders no longer subtract
++    anything from it. All of it shows as available and can be sold to new customers, while the
++    affected orders still need units. Total open demand can then exceed what exists.
++  - *Re-entering the goods.* When the same physical units are entered again, as a new stock entry
++    in the same warehouse or in another one after a move, the new row starts with nothing
++    allocated. The full count is available, including the units that were promised to open orders.
++    This is the case where already-promised goods are sold a second time, and it is the natural
++    next step after closing a warehouse or deleting an entry to correct it.
++  - Nothing re-creates the lost allocation. Raising the line quantity on an unconfirmed order
++    allocates only the increase.
++- **What staff see afterwards:**
++  - Fulfilling an affected order from the deleted warehouse fails with "insufficient stock". From
++    another warehouse it succeeds only if that warehouse has unreserved stock.
++  - With `allowStockToBeExceeded` it goes through without decreasing any stock.
++  - A fulfillment that was waiting for approval loses its stock link (`FulfillmentLine.stock` is set
++    to null) and can no longer be approved, except with `allowStockToBeExceeded`, which again
++    decreases nothing.
++  - Past fulfillments lose the record of which stock entry they shipped from.
++- **When:** every time an entry or warehouse with allocated stock is deleted.
++- **Where:** `saleor/warehouse/models.py:528`, `581-587`, `676-682` (cascades), `330-345`
++  (availability); `saleor/warehouse/management.py:60-67`, `542-545`, `669-681`;
++  `saleor/graphql/product/bulk_mutations/product_variant_stocks_delete.py:108-134`;
++  `saleor/graphql/warehouse/mutations/warehouse_delete.py:72-98`;
++  `saleor/graphql/product/bulk_mutations/product_variant_bulk_update.py:745-746`;
++  `saleor/order/models.py:866-872`; `saleor/order/actions.py:887-898`, `1164-1179`.
++- **Status:** Verified by reading, including the absence of any allocation check in the three
++  delete paths. Not run. Deleting without a guard may be intended; the silent loss of reservations
++  is the problem.
++
++### ST-8. Smaller items
++
++- Editing stock through `productVariantBulkUpdate` or `stockBulkUpdate` sends no out-of-stock or
++  back-in-stock events; the same edit through `productVariantStocksUpdate` does. Traced,
++  `saleor/graphql/product/bulk_mutations/product_variant_bulk_update.py:726-790`,
++  `saleor/graphql/warehouse/bulk_mutations/stock_bulk_update.py:384-409`.
++- Stock locks are taken in different orders by draft completion, line creation, restock and
++  checkout. Two of them on the same products can deadlock. Plausible.
++- `delete_empty_allocations_task` lists zero-quantity allocations, then deletes by id without
++  re-checking the quantity. A restock in between reuses the row and it is deleted while holding
++  stock. `update_stocks_quantity_allocated_task` computes its correction before writing and
++  overwrites concurrent changes. Verified for the missing re-check, `saleor/warehouse/tasks.py:16-63`,
++  `saleor/warehouse/management.py:80-87`. The timing is Plausible.
++- Click-and-collect points set to "all warehouses" are offered based on stock in warehouses outside
++  the order's channel; completion then fails. Traced, `saleor/warehouse/models.py:198-246`.
++- Legacy preorder code has further defects (`saleor/warehouse/management.py:993-1015`,
++  `saleor/warehouse/reservations.py:323`). They matter only if preorder data already exists.
++
++---
++
++## Fulfillment
++
++<a id="fu-1"></a>
++### FU-1. Two partial fulfillments of the same line at once ship more than was ordered
++
++- **What happens:** `create_fulfillments` locks and re-reads the order lines, but uses the fresh rows
++  only for validation. The fulfilled quantity is then written from the copies loaded before the
++  lock: `line.quantity_fulfilled += quantity` followed by a bulk update. Line of 4, two employees
++  each fulfil 2: both fulfillments are created and stock drops by 4, but the line records 2
++  fulfilled. The order shows 2 still to ship, and a third fulfillment is accepted.
++- **When:** concurrent. A second request that exceeds the remainder is caught; partial ones are not.
++- **Where:** `saleor/order/actions.py:1066-1073`, `1209-1218`, `1292-1300`;
++  `saleor/graphql/order/mutations/order_fulfill.py:218-245`.
++- **Status:** Verified.
++
++<a id="fu-2"></a>
++### FU-2. Approving a fulfillment twice decreases stock twice and issues gift cards twice
++
++- **What happens:** the "waiting for approval" check runs once, on a copy read before the
++  transaction. `approve_fulfillment` takes no lock and sets the status unconditionally. A second
++  approval waits for the first and then runs the whole body again: stock is decreased again, a
++  second set of gift cards with new codes is created and emailed, and events, webhooks and the
++  customer email are duplicated.
++- **When:** concurrent.
++- **Where:** `saleor/order/actions.py:864-942`;
++  `saleor/graphql/order/mutations/fulfillment_approve.py:55`, `86-106`.
++- **Status:** Verified.
++
++<a id="fu-3"></a>
++### FU-3. Cancelling a fulfillment twice restocks twice; approve racing cancel leaves contradictory state
++
++- **What happens:** `cancel_fulfillment` locks the fulfillment row but never looks at its status
++  again.
++  - Two cancels: stock and the allocation are increased twice and `quantity_fulfilled` is reduced
++    twice. It can go negative, since nothing in the database prevents it.
++  - Approve commits first, then cancel: the cancel takes the "was waiting" branch and returns no
++    stock, although the approval removed it.
++  - Cancel commits first, then approve: the cancelled fulfillment is set back to fulfilled and
++    stock is decreased, while `quantity_fulfilled` stays reduced, so the units can be fulfilled again.
++- **When:** concurrent.
++- **Where:** `saleor/order/actions.py:808-861`; `saleor/order/utils.py:662-674`;
++  `saleor/graphql/order/mutations/fulfillment_cancel.py:52-127`.
++- **Status:** Verified.
++
++### FU-4. Orders in any status can be fulfilled, and cancel races fulfil
++
++- **What happens:** `orderFulfill` checks payment, duplicates, quantities and preorder, but not the
++  order's status. Draft, unconfirmed, cancelled and expired orders can be fulfilled through the API.
++  The order status is then recomputed from quantities alone, so a cancelled order becomes fulfilled.
++  `orderCancel` checks `can_cancel()` before its transaction and writes the status without locking
++  the order, so a cancel and a fulfil at the same moment both succeed: the customer gets both emails.
++  An unconfirmed order that is fulfilled can no longer be confirmed, so the confirmation webhook,
++  email and gift-card charge never run.
++- **When:** every time through the API for the status gap; concurrent for the cancel race.
++- **Where:** `saleor/graphql/order/mutations/order_fulfill.py:190-203`;
++  `saleor/order/utils.py:159-207`; `saleor/graphql/order/mutations/order_cancel.py:21-66`;
++  `saleor/order/actions.py:422-454`.
++- **Status:** Verified.
++
++### FU-5. A fulfil request accepts lines from a different order
++
++- **What happens:** the order lines are loaded by id with no check that they belong to the order
++  named in the request. The fulfillment is attached to order X while its lines, quantities and stock
++  changes belong to order Y. Y's status is not updated. A channel-restricted employee can fulfil
++  lines of an order in a channel they cannot access, and an unpaid order can be fulfilled through a
++  paid one.
++- **When:** every time such a request is sent.
++- **Where:** `saleor/graphql/order/mutations/order_fulfill.py:216-223`;
++  `saleor/order/actions.py:1294-1305`.
++- **Status:** Verified.
++
++### FU-6. Refund and return fulfillments can be "cancelled"
++
++- **What happens:** the only guard is `status != CANCELED`. Cancelling a refunded, returned or
++  replaced fulfillment with a warehouse restocks its lines and reduces `quantity_fulfilled`. The
++  refund record becomes cancelled, the refunded lines look fulfillable again, and for a refund of
++  never-shipped items the restock adds inventory that never left the warehouse.
++- **When:** every time through the API.
++- **Where:** `saleor/order/models.py:845-846`;
++  `saleor/graphql/order/mutations/fulfillment_cancel.py:52-75`.
++- **Status:** Verified.
++
++### FU-7. Two fulfillments of one order can get the same number
++
++- **What happens:** the fulfillment number is "current maximum plus one", read without a lock, and
++  there is no unique constraint. Two fulfillments created together both become, say, `1234-2`.
++  History entries identify fulfillments only by that number.
++- **When:** concurrent.
++- **Where:** `saleor/order/models.py:832-843`.
++- **Status:** Verified.
++
++### FU-8. No fulfillment can be cancelled on an order that contains a gift card
++
++- **What happens:** the cancel mutation rejects any order with a gift-card line, before looking at
++  which fulfillment is being cancelled. A fulfillment of physical items created with the wrong
++  warehouse or quantity cannot be undone, and the order cannot be cancelled while it exists. The
++  message is "Cannot cancel fulfillment with gift card lines." even when the fulfillment has none.
++- **When:** every time.
++- **Where:** `saleor/graphql/order/mutations/fulfillment_cancel.py:77-100`.
++- **Status:** Verified.
++
++### FU-9. Payment-related status problems
++
++- **A paid order with a refund cannot be fulfilled when "allow unpaid fulfillment" is off.** The gate
++  is `total_charged >= total.gross`. A refund lowers the charged total, so the remaining items are
++  refused with "Cannot fulfill unpaid order." while the order shows as fully charged.
++  Setting-dependent (`fulfillment_allow_unpaid=False`; the default is on). Verified,
++  `saleor/order/models.py:441-442`, `saleor/graphql/order/mutations/order_fulfill.py:192-203`.
++- **With manual order confirmation, a paid unconfirmed order containing a digital gift card is
++  auto-fulfilled.** The gift-card code is emailed before staff review, the status leaves
++  "unconfirmed", and `orderConfirm` then refuses the order. Setting-dependent
++  (`automatically_confirm_all_new_orders=False`). Verified, `saleor/order/actions.py:402-409`,
++  `saleor/giftcard/utils.py:216-288`.
++- **A late payment revives a cancelled or expired order.** Becoming fully paid recomputes the status
++  for any non-draft order, so it returns to "unfulfilled" with no stock allocated. Verified,
++  `saleor/order/actions.py:408-409`.
++- **A second "fully paid" event on an order with a digital gift card raises an error.** The
++  auto-fulfillment runs again with nothing left to fulfil and fails after the payment amounts are
++  saved; the fully-paid webhooks are skipped. Verified for the mechanism,
++  `saleor/order/actions.py:566`, `saleor/giftcard/utils.py:257-288`.
++
++### FU-10. Tracking updates and approvals overwrite each other
++
++- **What happens:** both `orderFulfillmentUpdateTracking` and `approve_fulfillment` save the whole
++  fulfillment row from a copy read earlier. A tracking update that read the row just before an
++  approval can write the status back to "waiting for approval" after stock was taken; an approval
++  can erase a tracking number. Tracking updates are also accepted, and emailed, for cancelled
++  fulfillments.
++- **When:** concurrent for the overwrite; every time for the cancelled case.
++- **Where:** `saleor/graphql/order/mutations/fulfillment_update_tracking.py:61-76`;
++  `saleor/order/actions.py:874-875`.
++- **Status:** Verified.
++
++### FU-11. `FULFILLMENT_APPROVED` is not sent for most shipments
++
++- **What happens:** in the default auto-approve mode the webhook is sent only for the fulfillment
++  that makes the order completely fulfilled. Partial shipments never produce it.
++  `FULFILLMENT_CREATED` is sent from the approval path, so in manual-approval mode nothing but
++  `ORDER_UPDATED` announces a waiting fulfillment.
++- **When:** every time.
++- **Where:** `saleor/order/actions.py:591-610`, `630-641`.
++- **Status:** Verified.
++
++### FU-12. Smaller items
++
++- `orderBulkCancel` does not deactivate the order's gift cards; the single cancel does. Verified,
++  `saleor/graphql/order/bulk_mutations/order_bulk_cancel.py:38-53`.
++- `orderBulkCreate` reads stocks without a lock and later writes absolute quantities, undoing
++  fulfillments committed meanwhile. It computes an allocation that is never saved. Traced,
++  `saleor/graphql/order/bulk_mutations/order_bulk_create.py:2248-2327`.
++- `orderMarkAsPaid` does not run the fully-paid handling: no automatic gift-card fulfillment and no
++  payment-confirmation email. Traced, `saleor/order/actions.py:945-1051`.
++
++---
++
++## Returns and refunds
++
++<a id="rr-1"></a>
++### RR-1. A refund amount of 0 refunds the entire charged amount
++
++- **What happens:** `action_value = action_value or transaction.charged_value`. A zero amount is
++  treated as "not provided". The amount field accepts 0, and 0.004 rounds to 0.00. Granted refunds
++  behave the same, and a granted refund can legitimately be 0: free lines, free shipping, or a
++  grant created against a transaction with nothing charged yet. The same pattern applies to charge
++  and cancel.
++- **When:** every time.
++- **Where:** `saleor/graphql/payment/mutations/transaction/transaction_request_action.py:105-136`,
++  `283-284`; `transaction_request_refund_for_granted_refund.py:163-164`;
++  `saleor/graphql/core/scalars.py:49-71`.
++- **Status:** Verified.
++
++<a id="rr-2"></a>
++### RR-2. Transaction refunds have no lock: a double click sends two refunds
++
++- **What happens:** the granted-refund mutation reads the grant's status and the charged amount
++  without a lock, sends the request, and only afterwards marks the grant pending.
++  `transactionRequestAction` has no pending guard at all. The charged amount does not drop until
++  the payment app answers, so two requests both pass. For gift-card payments the whole path is
++  inside Saleor: the card is credited twice for one charge.
++- **When:** concurrent.
++- **Where:** `transaction_request_refund_for_granted_refund.py:71-120`, `160-210`;
++  `transaction_request_action.py:134-156`; `saleor/giftcard/gateway.py:408-472`.
++- **Status:** Verified for the mutations. The gift-card credit is Traced. Whether a payment provider
++  executes both requests depends on the provider.
++
++<a id="rr-3"></a>
++### RR-3. Line-based refund, return and replace have no lock and no re-validation
++
++- **What happens:** quantities are validated on unlocked copies and then written back as absolute
++  values. Two concurrent requests for the same line both succeed: the item is refunded twice while
++  the payment has enough captured, two return fulfillments exist for one unit, and with `replace`
++  two replacement draft orders are created. Fulfilling locks and re-checks; these paths do not.
++- **When:** concurrent. Sequential repeats are rejected.
++- **Where:** `saleor/graphql/order/mutations/fulfillment_refund_and_return_product_base.py:120-261`;
++  `saleor/order/actions.py:1385-1510`, `1525-1591`, `1909-2011`.
++- **Status:** Verified for the refund path. The return and replace paths are Traced.
++
++### RR-4. A granted refund can be pointed at another order's transaction
++
++- **What happens:** `orderGrantRefundUpdate` looks the transaction up globally, with no check that it
++  belongs to the grant's order. The create mutation restricts the lookup. Once attached, the refund
++  request skips its own order check and takes the money from the other order's payment.
++- **When:** every time such a request is sent.
++- **Where:** `saleor/graphql/order/mutations/order_grant_refund_update.py:332-336`; contrast
++  `order_grant_refund_create.py:254-260`; `transaction_request_refund_for_granted_refund.py:82-141`.
++- **Status:** Verified.
++
++<a id="rr-5"></a>
++### RR-5. A database error after the provider call rolls back Saleor's record of a refund
++
++*Corrected on re-examination. The first version said any failure in a later step loses the record.
++That was wrong for the refund mutation and overstated the likelihood. The entry was also removed
++from "Read these first".*
++
++- **Scope:** only `orderFulfillmentRefundProducts` and `orderFulfillmentReturnProducts` with
++  `refund: true`. Both act on a legacy `Payment` (`order.get_last_payment()`), not on Transactions
++  API payments. For a manual payment, such as one created by mark-as-paid, there is no provider
++  call, so a rollback loses nothing real.
++- **What is protected:** the refund mutation wraps its work in `transaction_with_commit_on_errors`,
++  which commits when an ordinary error is raised and then re-raises it. If a later step fails that
++  way, the refund record and the reduced captured amount are kept.
++- **What is not:**
++  - *Refund mutation, database error.* The same helper re-raises a `DatabaseError` inside the
++    transaction, so everything rolls back, including the refund record written just before. The
++    provider call has already happened.
++  - *Return mutation, any error.* It uses a plain transaction, so any exception after the provider
++    call rolls the record back.
++  - In both cases Saleor shows the payment as still fully captured, with no refund transaction and
++    no history, and a retry sends a second refund.
++- **When:** a database error is raised after the provider call. Two sources were found:
++  - A negative quantity on an order line. Validation only checks the upper bound, the amount can
++    still be positive through another line or an explicit amount, and the fulfillment-line insert
++    then violates its non-negative check. This is deterministic but needs an input a normal UI
++    would not send.
++  - A deadlock or lock timeout while releasing stock allocations. Plausible; not reproduced.
++  - No ordinary (non-database) error that realistically occurs after the provider call was found,
++    so the return mutation's wider exposure is structural rather than a known trigger.
++- **Where:** `saleor/order/actions.py:1549-1589` (refund), `1953-2010` (return), `2069-2098`
++  (provider call), `1436-1447` (the insert); `saleor/core/transactions.py:8-20`;
++  `saleor/payment/gateway.py:388-432`;
++  `saleor/graphql/order/mutations/fulfillment_refund_and_return_product_base.py:211-234`.
++- **Status:** Verified for the code path. The transaction behaviour is Reproduced with the helper's
++  body copied into a minimal script: ordinary error under the helper keeps the record; database
++  error under the helper loses it; either error under a plain transaction loses it. Not run against
++  Saleor itself or a real payment provider.
++
++### RR-6. Granted refunds can stick at "failure" or "pending"
++
++- **Failure although refunded.** If the payment app performs the refund but its response is lost or
++  times out, a failure event is written. A success reported later cannot be matched to the grant.
++  The grant shows failure, the employee re-sends, and the customer is refunded twice.
++- **Pending forever.** If the worker dies after sending the request, no result is ever recorded.
++  The grant stays pending, a retry is blocked with "The refund request is already in progress.", and
++  nothing resets it.
++- **When:** when a provider response is lost or a worker pod restarts mid-task.
++- **Where:** `saleor/webhook/transport/synchronous/transport.py:67-98`;
++  `saleor/payment/utils.py:1558-1589`; `saleor/order/utils.py:1147-1174`.
++- **Status:** Traced.
++
++### RR-7. Calculated refund amounts are a cent or more off
++
++- **What happens:** the refund is rebuilt as quantity times the rounded unit price, not from the line
++  total. Three items at 10.00 with a 5.00 voucher: line total 25.00, unit 8.33, refund 24.99. The
++  order keeps 0.01 captured, stays "partially refunded", and `ORDER_FULLY_REFUNDED` never fires.
++- **When:** every time a line total is not an exact multiple of its quantity.
++- **Where:** `saleor/order/actions.py:2021`, `2035`; `saleor/order/calculations.py:610-612`.
++- **Status:** Verified.
++
++### RR-8. Shipping can be refunded on every partial refund or return
++
++*Corrected on re-examination. The first version said "nothing records that shipping was already
++refunded". That was wrong: Saleor records it. The problem is that the line-based path never reads
++the record back.*
++
++- **What is recorded:**
++  - `Fulfillment.shipping_refund_amount` on the refund or return fulfillment, exposed in the API as
++    `shippingRefundedAmount` and in legacy webhook payloads.
++  - `shipping_costs_included` on the "fulfillment refunded" order-history event.
++  - `OrderGrantedRefund.shipping_costs_included` for granted refunds.
++- **What happens:** `orderFulfillmentRefundProducts` and `orderFulfillmentReturnProducts` add the
++  full shipping price whenever "include shipping costs" is set and the amount is calculated by
++  Saleor. Neither they nor the domain code look at earlier fulfillments' `shipping_refund_amount`.
++  The stored values are only read for display and webhook payloads. An order refunded or returned
++  in three parts with the flag set each time has shipping added three times, capped only by what is
++  still captured on the payment. Staff can see the earlier shipping refund on the previous
++  fulfillment; the mutation does not stop them repeating it.
++- **The one guard is separate.** Granted refunds reject a second shipping grant, but that check
++  looks only at other granted refunds. It does not see shipping refunded through the line-based
++  path, and the line-based path does not see granted refunds.
++- **The record is not always accurate:**
++  - A return with `refund: false` and the flag set still stores a shipping refund amount on the
++    fulfillment, although no money moved.
++  - The stored amount is the full shipping price even when the actual refund was capped lower.
++  - With a manual `amountToRefund`, shipping is not added and no amount is stored, but the history
++    event still says shipping costs were included if the flag was set.
++- **When:** every time an order is refunded or returned in parts with the flag set each time.
++- **Where:** `saleor/order/actions.py:2069-2073` (shipping added), `1513-1522`, `1545-1565`,
++  `1708-1713`, `1949-1951`, `2107`; `saleor/order/models.py:801`; `saleor/order/events.py:650-672`;
++  `saleor/graphql/order/types.py:1032-1042`;
++  `saleor/graphql/order/mutations/order_grant_refund_utils.py:21-29`.
++- **Status:** Verified by reading. A search for every use of `shipping_refund_amount` and
++  `shipping_costs_included` found no check outside the granted-refund one. Not run.
++
++### RR-9. Refund and return inputs are barely validated
++
++- **Lines of other orders are accepted.** Same gap as FU-5. The line is moved into a fulfillment of
++  the wrong order and the refund is computed from one order's price and taken from another's
++  payment. Verified, `fulfillment_refund_and_return_product_base.py:129-141`, `200-211`.
++- **Duplicate line ids misalign quantities.** Duplicates collapse in the lookup, then lines and
++  inputs are paired positionally, so quantities land on the wrong lines and the last input is
++  dropped without an error. Traced.
++- **Zero and negative quantities pass.** Only the upper bound is checked. A negative order-line
++  quantity leads to the database error in RR-5. Verified,
++  `fulfillment_refund_and_return_product_base.py:211-234`. A negative fulfillment-line quantity
++  reduces the refund and inflates the source line. Traced.
++- **Granted-refund amounts and quantities accept negatives.** A negative grant shrinks the granted
++  total and flips a paid order to "partially charged". Traced,
++  `saleor/graphql/order/mutations/order_grant_refund_create.py:60-74`, `177-196`.
++
++### RR-10. Granted-refund mutations skip the channel-access check
++
++- **What happens:** `orderGrantRefundCreate` and `orderGrantRefundUpdate` never call
++  `check_channel_permissions`; the other order money mutations do. A staff user restricted to one
++  channel can create or change granted refunds on orders in another, which changes that order's
++  charge status.
++- **When:** every time.
++- **Where:** `saleor/graphql/order/mutations/order_grant_refund_create.py:293-325`;
++  `order_grant_refund_update.py:449-468`.
++- **Status:** Verified.
++
++### RR-11. Order and stock state after refunds and returns
++
++- **Returns never put stock back.** There is no code path for it. This is absent functionality, not
++  a defect, but staff will need to adjust stock by hand.
++- Refunding lines from a fulfillment that is waiting for approval does not release its allocation,
++  so available stock is understated until the order is cancelled. Traced,
++  `saleor/order/actions.py:1451-1510`.
++- The line-based refund path never recalculates order status. A fully refunded, never-shipped order
++  stays "unfulfilled" and remains in the to-fulfil list. Traced, `saleor/order/actions.py:1525-1591`.
++- Refunding an already returned line loses its returned state, so it can be returned again. Traced.
++- Returns with only replaced or already-refunded lines leave an empty "returned" fulfillment. Traced.
++
++### RR-12. Smaller items
++
++- Every payment failure in the line-based mutations is reported as "The refund operation is not
++  available yet." with no failed-attempt event in the order history. Traced,
++  `fulfillment_refund_and_return_product_base.py:111-118`.
++- With a refund-reason type configured, staff cannot edit the reason of a pending or completed
++  granted refund: the two validation rules contradict each other. Sending only
++  `grantRefundForShipping: false` is rejected as "no field provided". Traced,
++  `order_grant_refund_update.py:148-189`, `259-278`.
++- Legacy `paymentRefund` with no amount refunds everything and then crashes while building the
++  notification, so the refund webhooks are never sent. Traced,
++  `saleor/graphql/payment/mutations/payment/payment_refund.py:38-68`.
++- `totalRemainingGrant` counts failed refund attempts. Traced, `saleor/graphql/order/types.py:3115-3122`.
++- Refunds requested for a granted refund do not record which employee sent them. Traced,
++  `transaction_request_refund_for_granted_refund.py:180-189`.
++
++---
++
++## Transactions API
++
++<a id="tx-1"></a>
++### TX-1. A payment report that fails half-way is never applied; the retry is told "already processed"
++
++- **What happens:** `transactionEventReport` saves the event in its own transaction. Recalculating
++  the transaction amounts and updating the order happen afterwards, in separate steps. If the pod
++  dies or an error is raised in between, the event exists but the order was never updated. When the
++  app retries, the duplicate check finds the event and returns `alreadyProcessed: true` without
++  recalculating anything. The employee sees a successful charge event on an unpaid order. It heals
++  only if another event later arrives for that transaction.
++- **When:** whenever the first attempt is interrupted after the event is saved: a pod restart, a
++  database error, or the gift-card error in FU-9.
++- **Where:** `saleor/graphql/payment/mutations/transaction/transaction_event_report.py:398-478`.
++- **Status:** Verified.
++
++### TX-2. "Fully paid" side effects can fire twice
++
++- **What happens:** whether to run the paid handling is decided from the change in the transaction's
++  charged amount, using a value read at the start of the request. Nothing asks whether the order was
++  already fully paid. When a charge report overlaps checkout completion, or two reports for one
++  transaction are processed together, `ORDER_PAID`, `ORDER_FULLY_PAID` and `ORDER_UPDATED` are sent
++  twice, two "fully paid" history events are written, the payment confirmation email goes out
++  twice, and gift-card auto-fulfillment is attempted twice (which raises, see FU-9, and then leads
++  to TX-1). Refund events duplicate the same way.
++- **When:** concurrent.
++- **Where:** `saleor/order/actions.py:697-706`, `716-783`; `saleor/payment/utils.py:1334-1427`;
++  `transaction_event_report.py:440-462`.
++- **Status:** Verified for the delta-based decision. The interleaving is Traced.
++
++### TX-3. Staff-requested actions are silently altered and not serialized
++
++- **What happens:** `transactionRequestAction` caps the amount at the current charged or authorized
++  value, read without a lock, and reports success either way. A refund of 50 on a transaction with
++  30 charged becomes 30 with no error. A refund on a transaction with nothing charged sends a
++  zero-amount request and reports success. A request in flight is not counted until the payment app
++  answers, so a second click sends a second request (RR-2). A transaction whose checkout was deleted
++  and has no order raises an internal error.
++- **When:** every time for the clamping; concurrent for the duplicate.
++- **Where:** `transaction_request_action.py:105-156`, `268-274`.
++- **Status:** Verified for the clamping and the missing lock.
++
++### TX-4. `transactionUpdate` can reset a paid transaction and double-count amounts
++
++- **What happens:** the mutation saves the whole transaction row from a copy read at the start, and
++  recalculates amounts only when the call includes money fields. An update that changes only
++  metadata, the message or available actions, while a charge report is being processed elsewhere,
++  writes the old amounts back: charged returns to 0 and the order shows unpaid until another event
++  arrives. Separately, "set charged to X" is stored as "add X minus current", computed without a
++  lock, so two identical calls record the charge twice.
++- **When:** concurrent.
++- **Where:** `saleor/graphql/payment/mutations/transaction/transaction_update.py:164-175`, `207`;
++  `saleor/payment/utils.py:1698-1811`.
++- **Status:** Verified for the full-row save. The double count is Traced.
++
++### TX-5. Events reported with an empty `pspReference` use different arithmetic
++
++- **What happens:** an empty string is accepted. Such events are handled as manual adjustments: a
++  charge does not reduce the authorized amount, a refund does not reduce the charged amount,
++  requests and failures are ignored, and a refund reversal raises charged without lowering refunded.
++  All events with an empty reference also collide in the duplicate check, so a second charge of the
++  same amount is reported as already processed and never recorded.
++- **When:** every time an app records cash or manual payments with an empty reference.
++- **Effect:** after authorising 100 and charging 100, both read 100. After refunding 100 the order
++  is still fully charged and refundable again.
++- **Where:** `saleor/payment/transaction_item_calculations.py:235-288`;
++  `transaction_event_report.py:93-95`; `saleor/payment/utils.py:1131-1151`.
++- **Status:** Verified for the arithmetic. The acceptance of an empty string is Traced.
++
++### TX-6. Channel restrictions are not enforced when recording payments
++
++- **What happens:** only `transactionRequestAction` and the granted-refund request check channel
++  access. `transactionCreate`, `transactionUpdate` and `transactionEventReport` do not. A staff user
++  limited to one channel, with payment permission, can record a charge on another channel's order
++  and trigger all the fully-paid side effects. The list query for transactions is scoped by channel
++  and owning app; the single `transaction` query is not, so an app can read another app's
++  transaction.
++- **When:** every time.
++- **Where:** `saleor/graphql/payment/mutations/transaction/transaction_create.py:340-346`;
++  `transaction_update.py:206-216`; `transaction_event_report.py:318-332`;
++  `saleor/graphql/payment/utils.py:22-46`; `saleor/graphql/payment/resolvers.py:35-73`.
++- **Status:** Verified for the mutations. The query is Traced.
++
++<a id="tx-7"></a>
++### TX-7. Transactions created with `transactionCreate` can be read without logging in
++
++- **What happens:** `transactionProcess` requires no permission; it relies on the transaction's
++  random token being unguessable (ADR 0010). But every transaction made by `transactionCreate` is
++  flagged to also accept its sequential integer id. If the transaction already has a final
++  authorization or charge event, the mutation returns the full transaction before any other check:
++  amounts, provider reference, external URL, all events and the linked order or checkout.
++- **When:** every time, for transactions recorded through `transactionCreate` with an authorized or
++  charged amount. Back-office payments recorded by staff or apps are exactly this kind.
++- **Where:** `saleor/graphql/payment/mutations/transaction/transaction_create.py:289-291`;
++  `transaction/utils.py:33-43`; `transaction_process.py:76-82`, `139-146`, `180-188`.
++- **Status:** Verified. ADR 0010 documents the token as a capability; it does not cover the
++  integer-id path.
++
++### TX-8. `transactionInitialize` without an amount asks for too much
++
++- **What happens:** the default amount is the stored checkout or order total minus existing
++  transactions. For a checkout that total is before gift cards, so a 100 checkout with a 30 gift
++  card requests 100, and the gift card is still drawn down at completion. For each transaction only
++  the larger of authorized and charged is subtracted, not their sum, so a partly captured
++  authorization is under-counted.
++- **When:** every time the amount is omitted in those two situations.
++- **Where:** `saleor/graphql/payment/mutations/base.py:104-122`.
++- **Status:** Verified.
++
++### TX-9. Payment-app responses are loosely validated
++
++- A response that is valid JSON but not an object (`[]`, `"ok"`) crashes the handler. The requested
++  charge, refund or cancel is left with no outcome and a granted refund stays pending.
++- Negative amounts are accepted from app responses, although GraphQL inputs reject them. A charge of
++  -50 lowers charged and raises authorized.
++- An explicit amount of 0 in a response becomes the full requested amount.
++- Amounts are kept to three decimals whatever the currency, so a checkout can sit at "partially
++  paid" or "overcharged" by a fraction of a cent.
++- **Where:** `saleor/payment/utils.py:853-921`, `993-1022`;
++  `saleor/webhook/response_schemas/transaction.py:152-207`.
++- **Status:** Traced.
++
++### TX-10. Smaller items
++
++- Transaction amounts are recalculated and saved after the row lock is released, from the copy read
++  before it. Two different events for one transaction on two pods can leave a committed event out of
++  the totals until the next event. The same save always rewrites metadata, overwriting concurrent
++  metadata changes. Verified for the lock scope, `transaction_event_report.py:398-452`.
++- `transactionUpdate(amountAuthorized: X)` does not reach X once a charge or cancel with a provider
++  reference exists: the adjustment is applied and the charge is subtracted again. Traced,
++  `saleor/payment/utils.py:1761-1780`.
++- A chargeback or refund reversal reported without an amount takes the amount of the newest event
++  with that provider reference on any transaction, not just its own. Verified,
++  `saleor/payment/utils.py:2071-2077`.
++- A failure response without a provider reference is matched against older failures of the same
++  type. The retry shows no outcome, or a misleading "already exists with different amount". Traced,
++  `saleor/payment/utils.py:1140-1175`.
++- A charge, refund or cancel request can end with no outcome event at all: if the app or webhook was
++  deactivated before the task ran, or the worker died mid-task. Nothing expires such requests.
++  Traced, `saleor/webhook/transport/synchronous/transport.py:74-98`. See RR-6.
++- `orderMarkAsPaid` checks "no transactions yet" without a lock. A double click creates two
++  full-amount transactions and an overcharged order. Verified,
++  `saleor/graphql/order/mutations/order_mark_as_paid.py:81-109`, `saleor/order/actions.py:1054-1063`.
++- The public `Order.transactionSummaries` field hides card digits but not the last characters of a
++  gift-card code. Traced, `saleor/graphql/payment/types.py:641-653`.
++
++---
++
++## Background tasks
++
++<a id="bg-1"></a>
++### BG-1. Order expiry counts a day as 24 minutes
++
++- **What happens:** the task computes an order's age in minutes as
++  `days * 24 + hours * 60 + minutes`. Days should be multiplied by 1440. An order aged 2 days 3 hours
++  counts as 228 minutes, not 3060. Settings under one day work. A setting of 1 day fires at about
++  1 day 23.5 hours. A setting of 2 days fires after about 62 days, and 3 days after about 122.
++  Until then the unconfirmed orders hold their stock allocations.
++- **When:** every time `expire_orders_after` is one day or more.
++- **Where:** `saleor/order/tasks.py:145-153`.
++- **Status:** Verified by arithmetic on the expression.
++
++### BG-2. Order expiry is decided on the read replica and applied without re-checking
++
++- **What happens:** candidates are selected on the replica: unconfirmed, no payments. The update on
++  the primary is `Order.objects.filter(id__in=ids_batch).update(status=EXPIRED, ...)`, with no status
++  or payment condition, followed by stock deallocation. An order confirmed or paid inside the
++  replica-lag window is still expired and loses its stock. The task is also not safe to run twice:
++  a duplicate run releases voucher usage a second time and writes a second "expired" event.
++  Each run handles at most 100 orders, every 5 minutes.
++- **When:** concurrent with staff confirming or a payment arriving; wider when the replica lags.
++- **Where:** `saleor/order/tasks.py:68-103`, `143-171`.
++- **Status:** Verified for the missing re-check. The timing is Plausible.
++
++<a id="bg-3"></a>
++### BG-3. A task interrupted by a pod restart is lost, and nothing re-drives it
++
++- **What happens:** `acks_late` is not configured, so a task is acknowledged when a worker picks it
++  up. If the pod is killed mid-run the task is gone. No task time limits are configured either, so
++  a hung task holds a worker slot indefinitely. The consequences elsewhere in this document: webhook
++  deliveries stay pending (WH-5), granted refunds stay pending (RR-6), and self-chaining clean-up
++  tasks stop until the next scheduled run.
++- **When:** on every worker pod restart, deploy or eviction that outlasts the shutdown grace period.
++- **Where:** `saleor/settings.py:630-648` (no `CELERY_TASK_ACKS_LATE`, no time limits);
++  `saleor/celeryconf.py`.
++- **Status:** Verified.
++
++### BG-4. Emails sent by the built-in email plugins are never retried
++
++- **What happens:** none of the 20 email tasks has a retry policy. One SMTP error loses the order
++  confirmation, fulfillment or refund email, and the "email sent" history event is not written.
++  The SMTP password is passed as a task argument, so it travels through the broker in every message.
++- **When:** every SMTP failure. Applies only if the User emails or Admin emails plugin is used.
++- **Where:** `saleor/plugins/user_email/tasks.py`, `saleor/plugins/admin_email/tasks.py`;
++  `saleor/plugins/email_common.py:47-55`, `210-246`.
++- **Status:** Verified.
++
++### BG-5. Without a broker URL every task runs inside the web request
++
++- **What happens:** `CELERY_TASK_ALWAYS_EAGER = not CELERY_BROKER_URL`. If the variable is missing in
++  an environment, nothing fails. Webhook sends, emails and exports simply run synchronously in the
++  request that triggered them.
++- **When:** whenever `CELERY_BROKER_URL` is unset.
++- **Where:** `saleor/settings.py:632-643`.
++- **Status:** Verified.
++
++---
++
++## Webhooks
++
++<a id="wh-1"></a>
++### WH-1. Retries of charge, refund and cancel requests send an empty body
++
++- **What happens:** these deliveries store their payload in a file, with the database column empty.
++  After any failed send, the failure handler calls `save_as_file()`, which reads the (empty) column
++  and writes it to a new file, replacing the real payload. The retry then posts an empty body,
++  correctly signed. A single 5xx from the payment app therefore cannot recover: every retry is
++  empty and the action ends as failed. The delivery shown in the dashboard is empty too, and a
++  manual retry also sends nothing.
++- **When:** every time the payment app answers a `TRANSACTION_CHARGE_REQUESTED`,
++  `TRANSACTION_REFUND_REQUESTED` or `TRANSACTION_CANCELATION_REQUESTED` with a 5xx.
++- **Where:** `saleor/core/models.py:189-209`; `saleor/webhook/transport/utils.py:676-688`;
++  `saleor/webhook/transport/synchronous/transport.py:67-98`, `185-189`, `314-323`.
++- **Status:** Verified.
++
++<a id="wh-2"></a>
++### WH-2. Webhooks installed from an app manifest ignore their channel filter
++
++- **What happens:** a subscription such as `orderUpdated(channels: ["b2b"])` is filtered before
++  dispatch using a column on the webhook, `filterable_channel_slugs`. Only the `webhookCreate` and
++  `webhookUpdate` mutations fill it in. Manifest installation creates the webhook without it, and
++  an empty list means "all channels". The app receives order, draft-order, checkout and stock
++  events for every channel, with full payloads.
++- **When:** every time, for any app installed from a manifest.
++- **Where:** `saleor/app/installation_utils.py:310-322`; `saleor/webhook/utils.py:202-222`; contrast
++  `saleor/graphql/webhook/mutations/webhook_create.py:155-166`.
++- **Status:** Verified.
++
++### WH-3. One legacy webhook can lose a price-change event for every app
++
++- **What happens:** `PRODUCT_VARIANT_DISCOUNTED_PRICE_UPDATED` is dispatched with no legacy payload.
++  If any active webhook without a subscription query is subscribed to it, or to `ANY_EVENTS`, the
++  dispatch raises `NotImplementedError`. Prices are already saved, so the next run sees no change
++  and the events are gone for all apps. The recalculation task also dies before clearing its dirty
++  flags.
++- **When:** every time, once such a webhook exists and a promotion or price change is processed.
++- **Where:** `saleor/plugins/webhook/plugin.py:2046-2063`;
++  `saleor/webhook/transport/asynchronous/transport.py:397-405`.
++- **Status:** Verified.
++
++### WH-4. `ANY_EVENTS` webhooks never receive order, draft-order or checkout events
++
++- **What happens:** order and checkout code looks webhooks up per event name from a precomputed map.
++  An `ANY_EVENTS` webhook is filed only under `any_events`, which nothing reads. The integration
++  gets product and customer events but no `ORDER_*`, `DRAFT_ORDER_*` or `CHECKOUT_*`, with no error
++  and no delivery row.
++- **When:** every time.
++- **Where:** `saleor/webhook/utils.py:129-199`; `saleor/order/actions.py:257-284`.
++- **Status:** Verified.
++
++<a id="wh-5"></a>
++### WH-5. Deliveries can stay pending forever
++
++- **What happens:** several paths leave a delivery `PENDING` and exit: a worker killed mid-send
++  (BG-3); an exception other than `ValueError` in the send task; the deferred-payload task giving up
++  on a lagging replica; a subscription whose query produces no data for an event it is subscribed
++  to. No scheduled task revisits pending deliveries. Only a manual retry moves one, and that cannot
++  help when the payload was never generated.
++- **When:** on worker restarts, storage errors, or misconfigured subscriptions.
++- **Where:** `saleor/webhook/transport/asynchronous/transport.py:614-632`, `731-750`, `804-857`;
++  `saleor/settings.py:673-769` (no sweeper in the beat schedule).
++- **Status:** Verified for the send task and the schedule. The deferred-payload paths are Traced.
++
++### WH-6. Retrying a failed delivery from the dashboard can repeat a payment action
++
++- **What happens:** `eventDeliveryRetry` accepts any delivery, including failed synchronous ones such
++  as a refund request. It re-sends it through the asynchronous sender and discards the answer. The
++  payment app is asked to refund again and Saleor records nothing. After a 5xx the body is empty
++  (WH-1). There is no check on the delivery's current status, so retrying while the original is
++  still retrying duplicates the send.
++- **When:** every time staff with app-management permission retry such a delivery.
++- **Where:** `saleor/graphql/webhook/mutations/event_delivery_retry.py:31-48`.
++- **Status:** Verified.
++
++### WH-7. Any staff member with an event's permission can send that event to any app
++
++- **What happens:** `webhookTrigger` requires only an authenticated staff user plus the permission of
++  the event itself, not app management. It creates a real, signed delivery to the production target
++  for an arbitrary existing object. Staff with order permission can replay `ORDER_CREATED` for an old
++  order into the ERP.
++- **When:** every time.
++- **Where:** `saleor/graphql/webhook/mutations/webhook_trigger.py:56-58`, `116-148`.
++- **Status:** Verified.
++
++### WH-8. A tax-app response with no `lines` key is accepted and zeroes the order subtotal
++
++- **What happens:** the response schema defaults `lines` to an empty list, and the line-count check
++  is a field validator, which does not run on defaults. The result is applied with a non-strict
++  `zip`, so no line is updated, the subtotal is set to 0 and the total to shipping only. No tax
++  error is recorded. An explicit empty list is rejected correctly.
++- **When:** every time the tax app returns 200 with shipping fields only.
++- **Where:** `saleor/webhook/response_schemas/taxes.py:15-35`; `saleor/order/calculations.py:575-634`.
++- **Status:** Verified by reading. The validator behaviour is pydantic's documented default and was
++  not executed.
++
++### WH-9. Storage and clean-up
++
++- **Default payload storage is local to the pod.** `PRIVATE_FILE_STORAGE` defaults to the local file
++  system. Without a private bucket configured, a payload file written by a web pod cannot be read
++  by a worker pod, and the send fails into WH-5. Verified, `saleor/settings.py:589-595`.
++- **Deliveries without a payload row are never cleaned up.** The daily clean-up deletes payloads and
++  relies on cascade. Deferred deliveries that failed before a payload was generated have none, so
++  the delivery table grows without bound. Verified for the clean-up task, `saleor/core/tasks.py:65-92`.
++- **Payload files are orphaned when the replica lags.** After a successful delivery the file list is
++  read from the replica while the rows are deleted on the primary. Files containing order and
++  customer data accumulate in the private bucket. Traced, `saleor/webhook/transport/utils.py:582-614`.
++- **Deleting a webhook deletes all its deliveries inside the request.** With a backlog this can time
++  out. Traced, `saleor/graphql/webhook/mutations/webhook_delete.py:82-86`.
++
++### WH-10. Synchronous webhooks can hold a request for a long time
++
++- `orderDiscountUpdate` calls the tax app inside an open database transaction, holding a connection
++  and a row lock for up to about 20 seconds when the app is slow. Traced,
++  `saleor/graphql/order/mutations/order_discount_update.py:78-92`.
++- The webhook timeout is per connect and per read, not total, and the whole response body is read
++  into memory. A target that trickles bytes can hold a request thread or worker slot. The circuit
++  breaker is off by default. Plausible, `saleor/webhook/transport/utils.py:246-287`.
++
++### WH-11. Behaviour to plan integrations around
++
++These are as designed, not defects.
++
++- **For some events, payloads show the state when they are built, not when the event happened**
++  (ADR 0011). The payload is generated later by a worker. Two quick changes produce two identical
++  deliveries; if the object is deleted first, the delivery fails and nothing is sent. An integration
++  cannot reconstruct per-refund amounts or intermediate states from these webhooks unless its
++  webhook is set to `IMMEDIATE`.
++
++  *Corrected on re-examination. The first version said this applied to "order, draft-order,
++  fulfillment and checkout events" as whole groups. It applies only to the 23 events flagged
++  `is_deferred_payload` in `saleor/webhook/event_types.py`:*
++
++  | Group | Built later by a worker | Built in the request, at the time of the event |
++  |---|---|---|
++  | Fulfillment | `FULFILLMENT_CANCELED`, `FULFILLMENT_METADATA_UPDATED`, `FULFILLMENT_TRACKING_NUMBER_UPDATED` | `FULFILLMENT_CREATED`, `FULFILLMENT_APPROVED` |
++  | Order | `ORDER_CREATED`, `ORDER_CONFIRMED`, `ORDER_PAID`, `ORDER_FULLY_PAID`, `ORDER_REFUNDED`, `ORDER_FULLY_REFUNDED`, `ORDER_UPDATED`, `ORDER_CANCELLED`, `ORDER_EXPIRED`, `ORDER_FULFILLED`, `ORDER_METADATA_UPDATED` | `ORDER_BULK_CREATED` |
++  | Draft order | `DRAFT_ORDER_CREATED`, `DRAFT_ORDER_UPDATED` | `DRAFT_ORDER_DELETED` |
++  | Checkout | `CHECKOUT_CREATED`, `CHECKOUT_UPDATED` | every other checkout event |
++  | Stock and price | the four per-channel in/out-of-stock events, `PRODUCT_VARIANT_DISCOUNTED_PRICE_UPDATED` | per-stock `PRODUCT_VARIANT_OUT_OF_STOCK` / `BACK_IN_STOCK` and everything else |
++
++  Even for the events in the middle column, the payload is built later only for webhooks with a
++  subscription query whose `payloadGeneration` is `DEFERRED` (the default). Webhooks without a
++  subscription query, and those set to `IMMEDIATE`, get a request-time payload. Verified,
++  `saleor/webhook/event_types.py`, `saleor/webhook/transport/asynchronous/transport.py:385`,
++  `420-436`.
++- **Retry policy:** five retries at 10, 20, 40, 80 and 160 seconds, then failed with no automatic
++  re-drive. 3xx and 4xx responses are never retried, including 429 and 408. Delivery is
++  at-least-once with no ordering guarantee.
++- **`issuedAt` on deferred events is the generation time**, not the request time.
++
++---
++
++## Cross-cutting
++
++### X-1. One failing post-commit step silently drops the ones after it
++
++- **What happens:** webhooks, emails and history events are registered as plain `on_commit`
++  callbacks. Django stops running the remaining callbacks of a transaction when one raises. The
++  database change is committed, the employee sees an error, a retry fails ("Only 0 items remaining",
++  "The order is not draft."), and the customer email or integration event is never sent.
++- **When:** whenever any callback raises, for example a broker error while enqueueing.
++- **Where:** `saleor/core/utils/events.py:19-28`; `saleor/order/actions.py:591-627`, `1321-1322`;
++  `saleor/graphql/order/mutations/draft_order_complete.py:270-293`.
++- **Status:** Plausible. The ordering and Django's behaviour are confirmed; how often a callback
++  raises in production is not known.
++
++### X-2. Mutations are not wrapped in a transaction
++
++There is no request-level or mutation-level transaction. Each mutation opens its own where its
++author thought of it. This is why so many entries above are "validated first, written later": the
++validation and the write are separate steps unless the code locks and re-reads, and most of it does
++not.
